@@ -21,42 +21,52 @@ const client = new Client({
   ]
 });
 
-/* ---------------- LAVALINK ---------------- */
-
 const nodes = [
   {
     name: "main",
-    url: process.env.LAVALINK_URL,
-    auth: process.env.LAVALINK_PASSWORD
+    host: process.env.LAVALINK_HOST,
+    port: Number(process.env.LAVALINK_PORT),
+    auth: process.env.LAVALINK_PASSWORD,
+    secure: process.env.LAVALINK_SECURE === "true"
   }
 ];
 
-const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes);
+const shoukaku = new Shoukaku(
+  new Connectors.DiscordJS(client),
+  nodes
+);
 
-/* ---------------- QUEUE ---------------- */
+shoukaku.on("ready", (name) => {
+  console.log(`${name} Lavalink connected`);
+});
+
+shoukaku.on("error", (name, error) => {
+  console.error(error);
+});
 
 const queue = new Map();
-
-/* ---------------- COMMANDS ---------------- */
 
 const commands = [
   new SlashCommandBuilder()
     .setName("play")
     .setDescription("Play music")
-    .addStringOption(o =>
-      o.setName("query").setDescription("Song name or URL").setRequired(true)
+    .addStringOption(option =>
+      option
+        .setName("query")
+        .setDescription("Song")
+        .setRequired(true)
     ),
 
-  new SlashCommandBuilder().setName("queue").setDescription("Show queue"),
-  new SlashCommandBuilder().setName("pause").setDescription("Pause"),
-  new SlashCommandBuilder().setName("resume").setDescription("Resume"),
-  new SlashCommandBuilder().setName("skip").setDescription("Skip"),
-  new SlashCommandBuilder().setName("stop").setDescription("Stop")
-].map(c => c.toJSON());
+  new SlashCommandBuilder()
+    .setName("skip")
+    .setDescription("Skip"),
+
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop")
+].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
-
-/* ---------------- REGISTER COMMANDS ---------------- */
 
 (async () => {
   try {
@@ -64,39 +74,34 @@ const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
       Routes.applicationCommands(process.env.CLIENT_ID),
       { body: commands }
     );
+
     console.log("Commands registered");
   } catch (err) {
     console.error(err);
   }
 })();
 
-/* ---------------- READY ---------------- */
-
 client.once("ready", () => {
   console.log(`${client.user.tag} online`);
 });
 
-/* ---------------- BUTTONS ---------------- */
-
-function buttons() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("pause").setLabel("Pause").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("resume").setLabel("Resume").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("skip").setLabel("Skip").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("stop").setLabel("Stop").setStyle(ButtonStyle.Danger)
-  );
-}
-
-/* ---------------- PLAY FUNCTION ---------------- */
-
 async function playNext(guildId) {
+
   const serverQueue = queue.get(guildId);
+
   if (!serverQueue) return;
 
-  const track = serverQueue.songs.shift();
-  if (!track) return;
+  if (serverQueue.songs.length === 0) {
+    serverQueue.player.destroy();
+    queue.delete(guildId);
+    return;
+  }
 
-  serverQueue.player.playTrack({ track: track.encoded });
+  const track = serverQueue.songs[0];
+
+  await serverQueue.player.playTrack({
+    track: track.encoded
+  });
 
   serverQueue.textChannel.send({
     embeds: [
@@ -104,125 +109,109 @@ async function playNext(guildId) {
         .setTitle("Now Playing")
         .setDescription(track.info.title)
         .setColor("Green")
-    ],
-    components: [buttons()]
+    ]
   });
 }
 
-/* ---------------- INTERACTIONS ---------------- */
-
-client.on("interactionCreate", async (interaction) => {
-
-  if (interaction.isButton()) {
-    const serverQueue = queue.get(interaction.guild.id);
-    if (!serverQueue) return;
-
-    if (interaction.customId === "pause") {
-      serverQueue.player.setPaused(true);
-      return interaction.reply({ content: "Paused", ephemeral: true });
-    }
-
-    if (interaction.customId === "resume") {
-      serverQueue.player.setPaused(false);
-      return interaction.reply({ content: "Resumed", ephemeral: true });
-    }
-
-    if (interaction.customId === "skip") {
-      serverQueue.player.stopTrack();
-      return interaction.reply({ content: "Skipped", ephemeral: true });
-    }
-
-    if (interaction.customId === "stop") {
-      serverQueue.songs = [];
-      serverQueue.player.destroy();
-      queue.delete(interaction.guild.id);
-      return interaction.reply({ content: "Stopped", ephemeral: true });
-    }
-  }
+client.on("interactionCreate", async interaction => {
 
   if (!interaction.isChatInputCommand()) return;
 
   const voice = interaction.member.voice.channel;
-  if (!voice) return interaction.reply("Join a voice channel first");
+
+  if (!voice) {
+    return interaction.reply("Join voice channel first");
+  }
 
   let serverQueue = queue.get(interaction.guild.id);
 
-  /* ---------------- PLAY ---------------- */
-
   if (interaction.commandName === "play") {
+
     const query = interaction.options.getString("query");
 
-    if (!serverQueue) {
-      const player = await shoukaku.joinVoiceChannel({
-        guildId: interaction.guild.id,
-        channelId: voice.id,
-        shardId: 0
-      });
+    try {
 
-      serverQueue = {
-        player,
-        songs: [],
-        textChannel: interaction.channel
-      };
+      if (!serverQueue) {
 
-      queue.set(interaction.guild.id, serverQueue);
+        const player = await shoukaku.joinVoiceChannel({
+          guildId: interaction.guild.id,
+          channelId: voice.id,
+          shardId: 0
+        });
+
+        serverQueue = {
+          player,
+          songs: [],
+          textChannel: interaction.channel
+        };
+
+        queue.set(interaction.guild.id, serverQueue);
+
+        player.on("end", () => {
+
+          serverQueue.songs.shift();
+
+          if (serverQueue.songs.length > 0) {
+            playNext(interaction.guild.id);
+          } else {
+            player.destroy();
+            queue.delete(interaction.guild.id);
+          }
+        });
+      }
+
+      const node = shoukaku.nodes.get("main");
+
+      const result = await node.rest.resolve(query);
+
+      if (!result.tracks.length) {
+        return interaction.reply("No results");
+      }
+
+      const track = result.tracks[0];
+
+      serverQueue.songs.push(track);
+
+      await interaction.reply(`Added: ${track.info.title}`);
+
+      if (serverQueue.songs.length === 1) {
+        playNext(interaction.guild.id);
+      }
+
+    } catch (err) {
+      console.error(err);
+      interaction.reply("Error");
     }
+  }
 
-    const result = await shoukaku.search(query);
+  if (interaction.commandName === "skip") {
 
-    if (!result.tracks.length)
-      return interaction.reply("No results found");
+    if (!serverQueue)
+      return interaction.reply("Nothing playing");
 
-    serverQueue.songs.push(result.tracks[0]);
+    serverQueue.songs.shift();
 
-    interaction.reply(`Added: ${result.tracks[0].info.title}`);
-
-    if (serverQueue.songs.length === 1) {
+    if (serverQueue.songs.length > 0) {
       playNext(interaction.guild.id);
+    } else {
+      serverQueue.player.destroy();
+      queue.delete(interaction.guild.id);
     }
+
+    interaction.reply("Skipped");
   }
-
-  /* ---------------- QUEUE ---------------- */
-
-  if (interaction.commandName === "queue") {
-    const serverQueue = queue.get(interaction.guild.id);
-
-    if (!serverQueue || !serverQueue.songs.length)
-      return interaction.reply("Queue empty");
-
-    const list = serverQueue.songs
-      .map((s, i) => `${i + 1}. ${s.info.title}`)
-      .join("\n");
-
-    interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("Queue")
-          .setDescription(list)
-          .setColor("Blue")
-      ]
-    });
-  }
-
-  /* ---------------- CONTROLS ---------------- */
-
-  const serverQueue = queue.get(interaction.guild.id);
-
-  if (!serverQueue) return;
-
-  if (interaction.commandName === "pause")
-    serverQueue.player.setPaused(true), interaction.reply("Paused");
-
-  if (interaction.commandName === "resume")
-    serverQueue.player.setPaused(false), interaction.reply("Resumed");
-
-  if (interaction.commandName === "skip")
-    serverQueue.player.stopTrack(), interaction.reply("Skipped");
 
   if (interaction.commandName === "stop") {
+
+    if (!serverQueue)
+      return interaction.reply("Nothing playing");
+
     serverQueue.songs = [];
+
     serverQueue.player.destroy();
+
     queue.delete(interaction.guild.id);
+
     interaction.reply("Stopped");
   }
 });
