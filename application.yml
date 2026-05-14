@@ -1,8 +1,0 @@
-server:
-  port: 2333
-
-lavalink:
-  server:
-    password: "youshallnotpass"
-
-plugins: []
